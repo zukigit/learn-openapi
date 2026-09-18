@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<!-- Served by the Go server at /docs. A tiny shell that loads Swagger UI
+     from a CDN and points it at the raw spec our own server exposes at
+     /openapi.json — no npm, no build step. -->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Todo API — Swagger UI</title>
+    <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css" />
+  </head>
+  <body>
+    <div id="swagger-ui"></div>
+    <script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js" crossorigin></script>
+    <script>
+      window.onload = () => {
+        window.ui = SwaggerUIBundle({
+          url: "/openapi.json", // the spec served by our own server
+          dom_id: "#swagger-ui",
+          deepLinking: true, // /docs#/Todos/… links work
+          tryItOutEnabled: true,
+        });
+      };
+    </script>
+  </body>
+</html>

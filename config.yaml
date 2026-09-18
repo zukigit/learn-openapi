@@ -1,6 +1,18 @@
-package: api
+# oapi-codegen configuration.
+#
+# Regenerate api/api.gen.go after every edit of api/openapi.yaml:
+#   oapi-codegen -config config.yaml api/openapi.yaml
+package: api # Go package name for the generated file
+
 generate:
-  models: true
-  std-http-server: true
-  strict-server: true
+  models: true # Go structs for every schema under components/schemas
+  gorilla-server: true # route glue for gorilla/mux (the HandlerFromMux func)
+  strict-server: true # typed request/response objects (the StrictServerInterface)
+  embedded-spec: true # embed the spec into the binary (the GetSwagger func)
+
 output: api/api.gen.go
+
+output-options:
+  # Prettier names for generated enum constants:
+  # TodoStatusInProgress instead of TodoStatusin_progress.
+  name-normalizer: ToCamelCase

@@ -1,78 +1,573 @@
+# =============================================================================
+# The OpenAPI "contract" — the single source of truth for this API.
+#
+# Spec-first workflow used in this repo:
+#   1. describe endpoints + schemas in this file
+#   2. regenerate the Go glue:  oapi-codegen -config config.yaml api/openapi.yaml
+#   3. implement the generated interface in cmd/server/server.go
+#
+# `openapi` declares the document dialect. 3.0.3 is still the most widely
+# supported by tooling. (3.1 aligns with JSON Schema 2020-12 — newer, nicer,
+# but some tools lag behind.)
+# =============================================================================
 openapi: "3.0.3"
+
+# -----------------------------------------------------------------------------
+# info: API metadata. This is what renders at the top of Swagger UI.
+# `description` is CommonMark (markdown) and can span multiple lines with `|`.
+# -----------------------------------------------------------------------------
 info:
-  title: Auth API
-  version: "0.1.0"
+  title: Todo API
+  version: 1.0.0
+  description: |
+    A learning API that demonstrates the OpenAPI features you'll meet in the
+    real world: **full CRUD**, path/query/header parameters, request
+    validation, reusable components, JWT security, pagination, error
+    responses and response headers.
+
+    Quick tour:
+      1. `POST /signup` to register, then `POST /login` to get a JWT.
+      2. Click **Authorize** in Swagger UI and paste the token.
+      3. Play with the `/todos` endpoints.
+  contact:
+    name: zuki
+    url: https://github.com/zukigit/learn-openapi
+  license:
+    name: MIT
+
+# -----------------------------------------------------------------------------
+# servers: where the API lives. Swagger UI uses the first entry as the base
+# URL for "Try it out". A relative URL ("/") means "same host that is serving
+# the docs page" — perfect for local dev.
+#
+# (FYI: server URLs may contain {variables}, e.g. https://{tenant}.example.com
+#  with a defaults/enum block per variable — less common, good to know.)
+# -----------------------------------------------------------------------------
+servers:
+  - url: /
+    description: Local development (same host as /docs)
+  - url: https://api.example.com
+    description: Production (fictional)
+
+# -----------------------------------------------------------------------------
+# tags: named groups that Swagger UI uses to organise endpoints. Every
+# operation below references one of these via its `tags` list.
+# -----------------------------------------------------------------------------
+tags:
+  - name: Auth
+    description: Sign up and log in to receive a JWT bearer token.
+  - name: Todos
+    description: |
+      CRUD on todos. Every todo belongs to the user who created it —
+      you only ever see your own.
+
+# -----------------------------------------------------------------------------
+# security: the GLOBAL default security requirement. With this block present,
+# every operation requires a bearer token — unless an individual operation
+# overrides it with `security: []` (that's how /signup and /login stay public).
+#
+# `bearerJWT` is the name of a scheme declared in components/securitySchemes.
+# The empty list after the colon means "no OAuth scopes" (scopes only matter
+# for OAuth2 flows).
+# -----------------------------------------------------------------------------
+security:
+  - bearerJWT: []
 
 paths:
+  # ===========================================================================
+  # Auth endpoints (public)
+  # ===========================================================================
   /signup:
     post:
+      tags: [Auth]
+      operationId: signup # becomes the Go method name: Server.Signup
       summary: Register a new user
+      security: [] # empty list = overrides the global default → PUBLIC
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              type: object
-              required: [email, password]
-              properties:
-                email:
-                  type: string
-                  format: email
-                password:
-                  type: string
-                  format: password
-                  minLength: 8
+              $ref: "#/components/schemas/Credentials" # reuse beats repetition
+            examples:
+              valid:
+                summary: A valid signup
+                value:
+                  email: ada@example.com
+                  password: correct-horse-battery
       responses:
         "201":
-          description: User created
+          description: User created.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/User"
         "409":
-          description: Email already exists
+          description: Email already registered.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
   /login:
     post:
-      summary: Authenticate and receive a token
+      tags: [Auth]
+      operationId: login
+      summary: Log in and receive a JWT bearer token
+      security: [] # public
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              type: object
-              required: [email, password]
-              properties:
-                email:
-                  type: string
-                  format: email
-                password:
-                  type: string
-                  format: password
+                $ref: "#/components/schemas/Credentials"
       responses:
         "200":
-          description: Login successful
+          description: Login successful.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Token"
         "401":
-          description: Invalid credentials
+          # A whole reusable response — one $ref instead of repeating the
+          # description + body every time.
+          $ref: "#/components/responses/Unauthorized"
 
+  # ===========================================================================
+  # Todo collection endpoints
+  # ===========================================================================
+  /todos:
+    get:
+      tags: [Todos]
+      operationId: listTodos
+      summary: List your todos
+      description: >
+        Returns the caller's todos, newest first by default. Supports
+        status filtering and offset pagination.
+      parameters:
+        # Reusable parameter components — see components/parameters below.
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Offset"
+
+        # Inline query params. `enum` restricts allowed values; the runtime
+        # validator (middleware) rejects anything else with a 400.
+        - name: status
+          in: query
+          description: Only return todos with this status. Omit for all.
+          schema:
+            type: string
+            enum: [todo, in_progress, done]
+        - name: sort
+          in: query
+          description: Sort order. `-` prefix means descending.
+          schema:
+            type: string
+            enum: [created_at, "-created_at", title]
+            default: "-created_at"
+
+        # Header params are declared exactly like query params, just `in: header`.
+        - name: X-Request-ID
+          in: header
+          description: Optional client-supplied ID for tracing requests.
+          schema:
+            type: string
+            format: uuid # if present but malformed → 400 from the validator
+      responses:
+        "200":
+          description: A page of todos.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TodoList"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+    post:
+      tags: [Todos]
+      operationId: createTodo
+      summary: Create a todo
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NewTodo"
+            examples:
+              minimal:
+                summary: Bare minimum (title only)
+                value:
+                  title: Learn OpenAPI
+              full:
+                summary: All fields
+                value:
+                  title: Ship the API
+                  description: Write spec, generate code, implement handlers
+                  status: in_progress
+      responses:
+        "201":
+          description: >
+            Created. The new todo is returned in the body, and the `Location`
+            response header points at it — a classic REST convention.
+          headers:
+            Location:
+              description: URL of the newly created todo.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Todo"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  # ===========================================================================
+  # Single-todo endpoints.
+  #
+  # {id} is a path parameter. Declaring `parameters` at the PATH level (not
+  # inside a specific operation) applies it to every operation below — that's
+  # how you avoid repeating yourself for get/put/patch/delete.
+  # ===========================================================================
+  /todos/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true # path params are ALWAYS required (the spec enforces this)
+        description: The todo's UUID.
+        schema:
+          type: string
+          format: uuid # the runtime validator 400s on a malformed UUID
+
+    get:
+      tags: [Todos]
+      operationId: getTodo
+      summary: Get one todo
+      responses:
+        "200":
+          description: The todo.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Todo"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+    # PUT = full replacement: the body is the complete new state of the
+    # resource (same shape as create). Omitted fields are reset to defaults.
+    put:
+      tags: [Todos]
+      operationId: replaceTodo
+      summary: Replace a todo entirely (PUT)
+      description: >
+        PUT replaces the whole resource — the body is the complete new state,
+        same shape as POST. Fields you omit are reset. Compare with PATCH,
+        which only touches the fields you send.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NewTodo"
+      responses:
+        "200":
+          description: The todo after replacement.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Todo"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+    # PATCH = partial update: only the fields you send are changed.
+    patch:
+      tags: [Todos]
+      operationId: updateTodo
+      summary: Update a todo partially (PATCH)
+      description: >
+        PATCH only changes the fields present in the body; omitted fields
+        keep their current values. See `UpdateTodo` for why `minProperties`
+        matters here.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateTodo"
+            examples:
+              startIt:
+                summary: Mark a todo as in progress
+                value:
+                  status: in_progress
+      responses:
+        "200":
+          description: The todo after the update.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Todo"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+    delete:
+      tags: [Todos]
+      operationId: deleteTodo
+      summary: Delete a todo
+      responses:
+        "204":
+          description: Deleted. 204 is the convention for success + empty body.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+# =============================================================================
+# components: the reusable toolbox. Anything defined here gets a $ref-able
+# name and (for schemas) a generated Go type. Keeping things here instead of
+# inlining them everywhere is the difference between a spec that scales and
+# one that rots.
+# =============================================================================
 components:
+  # securitySchemes: HOW clients authenticate. Referred to by name from the
+  # top-level `security` block.
+  securitySchemes:
+    bearerJWT:
+      # type: http + scheme: bearer → `Authorization: Bearer <token>` header.
+      type: http
+      scheme: bearer
+      bearerFormat: JWT # documentation-only hint for humans
+      description: >
+        Paste the token returned by POST /login. Don't include the "Bearer "
+        prefix — Swagger UI adds it for you.
+
+  # Reusable request parameters (referenced from operations via $ref).
+  parameters:
+    Limit:
+      name: limit
+      in: query
+      description: Page size, 1-100.
+      schema:
+        type: integer
+        minimum: 1 # validator 400s on 0, -5, ...
+        maximum: 100 # ...and on 1000
+        default: 20 # used when the client omits the param
+    Offset:
+      name: offset
+      in: query
+      description: Number of items to skip before this page.
+      schema:
+        type: integer
+        minimum: 0
+        default: 0
+
+  # Reusable responses: describe an error shape ONCE, reference it everywhere.
+  responses:
+    Unauthorized:
+      description: Missing or invalid bearer token.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            message: missing or invalid Authorization header
+    NotFound:
+      description: Resource not found (or it belongs to another user).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            message: todo not found
+    BadRequest:
+      description: Request failed validation (bad body or parameters).
+      content:
+        application/json:
+          schema:
+                $ref: "#/components/schemas/Error"
+
+  # schemas: the data model. Each named schema becomes a Go struct in
+  # api/api.gen.go (e.g. Todo, NewTodo, Error...).
   schemas:
+    # The uniform error body used by EVERY non-2xx response in this API.
+    Error:
+      type: object
+      description: Uniform error body for every non-2xx response.
+      required: [message]
+      # additionalProperties: false → unknown fields are rejected by the
+      # validator. Without it, {"message": "...", "surprise": 1} would pass.
+      additionalProperties: false
+      properties:
+        message:
+          type: string
+          description: Human-readable explanation of what went wrong.
+          example: todo not found
+
+    # A user as returned by signup (never sent by clients).
     User:
       type: object
+      required: [id, email]
+      additionalProperties: false
       properties:
         id:
           type: string
           format: uuid
         email:
           type: string
+          format: email # validator 400s on "not-an-email"
+
+    # Request body for /signup and /login — one schema, two uses.
+    Credentials:
+      type: object
+      description: Credentials for signup and login.
+      required: [email, password]
+      additionalProperties: false
+      properties:
+        email:
+          type: string
           format: email
+          minLength: 3
+        password:
+          type: string
+          # `format: password` is a UI HINT only (mask the input field);
+          # it has no validation meaning — unlike format: email/uuid.
+          format: password
+          minLength: 8 # validator 400s on short passwords
+          maxLength: 128
 
     Token:
       type: object
+      description: JWT issued by POST /login.
+      required: [token]
+      additionalProperties: false
       properties:
         token:
           type: string
+
+    # A named enum becomes a distinct Go type + constants after codegen
+    # (api.TodoStatus, api.TodoStatusInProgress, ...).
+    TodoStatus:
+      type: string
+      description: Lifecycle of a todo.
+      enum: [todo, in_progress, done] # 3.0 style: enum directly on the schema
+
+    # The READ model: a todo as returned by the API. Note it is only ever
+    # referenced from RESPONSES, never from request bodies.
+    Todo:
+      type: object
+      description: A todo as returned by the API (responses only).
+      required: [id, title, status, created_at, updated_at]
+      additionalProperties: false
+      properties:
+        id:
+          type: string
+          format: uuid
+          # readOnly = "server-generated, appears in responses, must NOT
+          # appear in request bodies". The validator enforces exactly that.
+          readOnly: true
+        title:
+          type: string
+          minLength: 1
+          maxLength: 200
+        description:
+          type: string
+          maxLength: 2000
+        status:
+          $ref: "#/components/schemas/TodoStatus"
+        created_at:
+          type: string
+          format: date-time # RFC 3339, e.g. 2026-09-18T12:00:00Z
+          readOnly: true
+        updated_at:
+          type: string
+          format: date-time
+          readOnly: true
+
+    # The WRITE model for full creates/replacements (POST /todos,
+    # PUT /todos/{id}). Only `title` is mandatory; everything else has a
+    # default or is optional.
+    NewTodo:
+      type: object
+      description: Body for POST /todos and PUT /todos/{id} (full replace).
+      required: [title]
+      additionalProperties: false
+      properties:
+        title:
+          type: string
+          minLength: 1 # the validator 400s on "" — note Go's encoding/json
+          maxLength: 200 # would happily accept it; the spec catches what code forgets
+          example: Read the OpenAPI 3.0 spec
+        description:
+          type: string
+          maxLength: 2000
+        status:
+          # Inline enum (can't $ref TodoStatus here because we also want a
+          # default, and in 3.0 you can't add sibling keywords next to $ref).
+          type: string
+          enum: [todo, in_progress, done]
+          default: todo
+          description: Defaults to `todo` when omitted.
+
+    # The WRITE model for PATCH: every field optional, BUT minProperties: 1
+    # forces the client to send at least one — an empty PATCH is a mistake,
+    # and the validator says so with a 400.
+    UpdateTodo:
+      type: object
+      description: Body for PATCH /todos/{id}. Omitted fields keep their values.
+      minProperties: 1
+      additionalProperties: false
+      properties:
+        title:
+          type: string
+          minLength: 1
+          maxLength: 200
+        description:
+          type: string
+          maxLength: 2000
+        status:
+          type: string
+          enum: [todo, in_progress, done]
+
+    # List envelope: the items plus pagination metadata. Envelope objects
+    # like this are how you attach meta info to a list without breaking
+    # JSON's "top level must be an object/array" rules.
+    TodoList:
+      type: object
+      description: A page of todos plus pagination metadata.
+      required: [items, pagination]
+      additionalProperties: false
+      properties:
+        items:
+          type: array
+          description: Todos in this page.
+          items:
+            $ref: "#/components/schemas/Todo"
+        pagination:
+          $ref: "#/components/schemas/Pagination"
+
+    Pagination:
+      type: object
+      description: Where this page sits in the full result set.
+      required: [total, limit, offset]
+      additionalProperties: false
+      properties:
+        total:
+          type: integer
+          description: Total items matching the filter (before paging).
+        limit:
+          type: integer
+          description: Page size actually used (after applying the default).
+        offset:
+          type: integer
+          description: Number of items skipped before this page.
