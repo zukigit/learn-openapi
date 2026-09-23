@@ -1,0 +1,5 @@
+{
+  "name": "rhel9-dev",
+  "image": "docker.io/zukidocker/dev:rhel9",
+  "remoteUser": "root"
+}
