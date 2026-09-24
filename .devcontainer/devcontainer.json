@@ -1,5 +1,19 @@
 {
   "name": "rhel9-dev",
   "image": "docker.io/zukidocker/dev:rhel9",
-  "remoteUser": "root"
+  "remoteUser": "root",
+
+  "appPort": [8080],
+
+  "portsAttributes": {
+    "8080": {
+      "label": "Backend API",
+      "onAutoForward": "openBrowser"
+    }
+  },
+
+  "mounts": [
+    "source=${localEnv:HOME}/.ssh,target=/root/.ssh,type=bind,readonly",
+    "source=${localEnv:HOME}/.gitconfig,target=/root/.gitconfig,type=bind"
+  ]
 }
