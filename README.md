@@ -37,8 +37,8 @@ Then open http://localhost:8080/docs (Swagger UI) or fetch the raw spec at
   (schemas, parameters, responses, securitySchemes)
 - Validation keywords enforced at runtime (`required`, `minLength`,
   `maxLength`, `enum`, `minimum`/`maximum`, `minProperties`,
-  `additionalProperties`, `format`) via a kin-openapi middleware built on the
-  embedded spec
+  `additionalProperties`, `format`) via the oapi-codegen ecosystem's
+  nethttp-middleware (kin-openapi's validator) built on the embedded spec
 - JWT security: `bearerJWT` scheme enforced per-operation straight from the
   spec's `security` section (public endpoints opt out with `security: []`)
 - Pagination (`limit`/`offset`), a uniform `Error` body, response headers

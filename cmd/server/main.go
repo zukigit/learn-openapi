@@ -31,7 +31,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("loading embedded spec: %v", err)
 	}
-	validator, err := NewRequestValidator(spec, server.Authenticate)
+	validator, err := NewRequestValidator(spec)
 	if err != nil {
 		log.Fatalf("building request validator: %v", err)
 	}
@@ -47,9 +47,11 @@ func main() {
 	// only to them — not to /docs or /openapi.json. Middleware order =
 	// request flow order, each wrapping the next:
 	//
-	//   logging -> spec validation (params + body + security) -> strict handler
+	//   logging -> auth (JWT -> context) -> spec validation (security +
+	//   params + body) -> strict handler
 	apiRouter := r.NewRoute().Subrouter()
 	apiRouter.Use(LoggingMiddleware)
+	apiRouter.Use(server.AuthMiddleware)
 	apiRouter.Use(validator)
 
 	// Generated glue from oapi-codegen (config.yaml: gorilla-server: true):

@@ -1,8 +1,24 @@
 package main
 
 // Middleware: everything that happens to a request BEFORE it reaches a
-// handler — logging, plus the request validator (which also enforces the
-// spec's `security` section via the AuthenticationFunc callback).
+// handler. The heavy lifting is done by existing libraries, not by us:
+//
+//   - request validation + security enforcement come from the oapi-codegen
+//     ecosystem's nethttp-middleware (a thin wrapper over kin-openapi's
+//     openapi3filter — the same validator engine the hand-rolled version
+//     used to call directly);
+//   - JWT verification is golang-jwt/jwt/v5.
+//
+// What remains hand-written is only what no library can know:
+//
+//   1. LoggingMiddleware     — one log line per request.
+//   2. Server.AuthMiddleware — verifies OUR tokens with OUR secret and
+//                              stamps the user into the request context.
+//   3. enforceSecurity       — the kin-openapi AuthenticationFunc: turns
+//                              the spec's DECLARED security into ENFORCED
+//                              security.
+//   4. NewRequestValidator   — thin wiring: hands the spec and the
+//                              AuthenticationFunc to the library middleware.
 
 import (
 	"context"
@@ -15,8 +31,8 @@ import (
 
 	"github.com/getkin/kin-openapi/openapi3"
 	"github.com/getkin/kin-openapi/openapi3filter"
-	"github.com/getkin/kin-openapi/routers/gorillamux"
 	"github.com/golang-jwt/jwt/v5"
+	nethttpmiddleware "github.com/oapi-codegen/nethttp-middleware"
 
 	"github.com/zukigit/learn-openapi/api"
 )
@@ -83,39 +99,58 @@ func LoggingMiddleware(next http.Handler) http.Handler {
 }
 
 // ---------------------------------------------------------------------------
-// Authentication — ENFORCES the spec's `security` section
+// Authentication — two pieces, one job each
 // ---------------------------------------------------------------------------
-
-// authError marks failures coming from the authentication callback so the
-// validation middleware can answer them with 401 instead of 400.
-type authError struct{ message string }
-
-func (e *authError) Error() string { return e.message }
-
-// Authenticate is the kin-openapi "AuthenticationFunc": it turns the spec's
-// DECLARED security into ENFORCED security.
 //
-// Here is how the spec drives it: for every operation that carries security
-// requirements, the validator calls this function; operations declared with
-// `security: []` (like /signup and /login) are skipped entirely — public by
-// spec, public in code, no hardcoded path list to maintain. Adding or
-// removing `security` in openapi.yaml changes real behavior here.
+// The spec's `security` section says WHICH operations need auth; the JWT
+// says WHO is calling. Enforcing that takes two pieces:
 //
-// It implements the `bearerJWT` scheme from components/securitySchemes:
-// "Authorization: Bearer <token>", token verified with the server's secret.
-// On success it stamps the token's `sub` claim (the user's email) into the
-// request context, where strict handlers read it via userFromContext.
-func (s *Server) Authenticate(ctx context.Context, input *openapi3filter.AuthenticationInput) error {
-	r := input.RequestValidationInput.Request
+//	AuthMiddleware  (runs first, on every request) verifies the bearer
+//	                token, if any, and stamps the user into the request
+//	                context.
+//	enforceSecurity (invoked by the validator, only for operations that
+//	                carry security requirements) rejects requests whose
+//	                context carries no user — the 401.
+//
+// Operations declared with `security: []` (like /signup and /login) never
+// reach enforceSecurity: public by spec, public in code, no hardcoded path
+// list to maintain. Adding or removing `security` in openapi.yaml changes
+// real behavior.
+//
+// Why verify in a middleware instead of inside the AuthenticationFunc?
+// The library serves the request object it was handed, so a request
+// swapped inside the AuthenticationFunc never reaches the handler (see
+// https://github.com/oapi-codegen/nethttp-middleware/issues/60). The user
+// has to be in the context BEFORE validation starts.
 
-	// The spec says type: http / scheme: bearer — i.e. this exact header
-	// format: "Authorization: Bearer <token>".
-	auth := r.Header.Get("Authorization")
-	if !strings.HasPrefix(auth, "Bearer ") {
-		return &authError{"missing or invalid Authorization header"}
-	}
-	tokenString := strings.TrimPrefix(auth, "Bearer ")
+// AuthMiddleware implements the `bearerJWT` scheme from
+// components/securitySchemes: "Authorization: Bearer <token>", verified
+// with the server's secret. On success the token's `sub` claim (the user's
+// email) is stamped into the request context, where strict handlers read
+// it via userFromContext.
+//
+// It deliberately does NOT reject requests: public operations must work
+// with a missing — or even garbage — Authorization header. Whether a user
+// is REQUIRED is the spec's call, enforced one step later by
+// enforceSecurity.
+func (s *Server) AuthMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
+			if sub, err := s.verifyBearer(strings.TrimPrefix(auth, "Bearer ")); err == nil {
+				r = r.WithContext(withUser(r.Context(), sub))
+			}
+			// Invalid token: leave the context untouched. If the operation
+			// requires auth, enforceSecurity answers with a 401; if it's
+			// public, the request proceeds unauthenticated — exactly what
+			// the spec's `security: []` promises.
+		}
+		next.ServeHTTP(w, r)
+	})
+}
 
+// verifyBearer checks the token with the server's secret and returns its
+// `sub` claim (the user's email).
+func (s *Server) verifyBearer(tokenString string) (string, error) {
 	claims := jwt.MapClaims{}
 	token, err := jwt.ParseWithClaims(tokenString, claims, func(t *jwt.Token) (any, error) {
 		// Only accept OUR signing method. Deriving the algorithm from the
@@ -127,18 +162,29 @@ func (s *Server) Authenticate(ctx context.Context, input *openapi3filter.Authent
 		return s.jwtSecret, nil
 	})
 	if err != nil || !token.Valid {
-		return &authError{"invalid or expired token"}
+		return "", errors.New("invalid or expired token")
 	}
 
 	sub, _ := claims["sub"].(string)
 	if sub == "" {
-		return &authError{"token has no subject claim"}
+		return "", errors.New("token has no subject claim")
 	}
+	return sub, nil
+}
 
-	// Authenticated: carry the user onward for the handlers. Swapping the
-	// request inside the validation input propagates the context to whoever
-	// serves it next.
-	input.RequestValidationInput.Request = r.WithContext(withUser(r.Context(), sub))
+// enforceSecurity is the kin-openapi "AuthenticationFunc" handed to the
+// validation middleware. The validator calls it for every operation that
+// carries security requirements, with one job: is the caller authenticated?
+//
+// The token itself was already verified by AuthMiddleware — so "who signed
+// it, and is the signature valid?" reduces here to "did a valid bearer
+// token reach this far?" Any error returned is wrapped by the validator in
+// a SecurityRequirementsError, which the library middleware answers with
+// the 401 the spec promises.
+func enforceSecurity(ctx context.Context, _ *openapi3filter.AuthenticationInput) error {
+	if userFromContext(ctx) == "" {
+		return errors.New("missing or invalid Authorization header")
+	}
 	return nil
 }
 
@@ -147,73 +193,46 @@ func (s *Server) Authenticate(ctx context.Context, input *openapi3filter.Authent
 // ---------------------------------------------------------------------------
 
 // NewRequestValidator builds the middleware that validates every request
-// against the OpenAPI spec at runtime.
+// against the OpenAPI spec at runtime, using the oapi-codegen ecosystem's
+// nethttp-middleware library (a thin wrapper over kin-openapi's
+// openapi3filter). The library does everything the hand-rolled version
+// used to do:
 //
-// WHY THIS EXISTS (the #1 oapi-codegen gotcha): the generated strict
+//   - matches requests to operations declared in the spec (its internal
+//     router is kin-openapi's gorilla/mux router — the same one as before);
+//   - enforces the `security` section via the enforceSecurity callback;
+//   - checks every constraint in openapi.yaml (required, minLength, enum,
+//     minimum/maximum, additionalProperties, format, ...);
+//   - maps failures to the right status codes: 401 security failures,
+//     400 validation failures, 405 wrong method, 404 unknown path.
+//
+// WHY VALIDATION EXISTS (the #1 oapi-codegen gotcha): the generated strict
 // handlers decode JSON into typed structs, but encoding/json does not
 // enforce schema constraints. {"title": ""} violates minLength: 1 in the
 // spec, yet decodes into a Go string happily. This middleware closes the
-// gap: every constraint in openapi.yaml (required, minLength, enum,
-// minimum/maximum, additionalProperties, format, ...) is checked here,
-// and violations get the 400 response the spec promises.
+// gap — and it validates against the spec EMBEDDED IN THE BINARY
+// (api.GetSpec, enabled by `embedded-spec: true` in config.yaml), so the
+// running server always matches the exact spec version it was compiled
+// from.
 //
-// It also runs the security checks described above, and it validates
-// against the spec EMBEDDED IN THE BINARY (api.GetSpec, enabled by
-// `embedded-spec: true` in config.yaml) — so the running server always
-// matches the exact spec version it was compiled from.
-func NewRequestValidator(spec *openapi3.T, auth openapi3filter.AuthenticationFunc) (func(http.Handler) http.Handler, error) {
+// Our ErrorHandler just re-shapes the library's errors into the uniform
+// components/schemas/Error body ({"message": "..."}) the spec promises.
+func NewRequestValidator(spec *openapi3.T) (func(http.Handler) http.Handler, error) {
 	// kin-openapi requires a validated spec before building a router.
 	if err := spec.Validate(context.Background()); err != nil {
 		return nil, err
 	}
 
-	// kin-openapi's own gorilla/mux router: matches incoming requests to
-	// operations declared in the spec. (Yes — gorilla again, the same
-	// library the server itself routes with.)
-	router, err := gorillamux.NewRouter(spec)
-	if err != nil {
-		return nil, err
-	}
-
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// 1. Match the request against an operation in the spec.
-			route, pathParams, err := router.FindRoute(r)
-			if err != nil {
-				// The outer gorilla/mux router only dispatches real API
-				// routes here, so a miss means "right path, wrong method".
-				writeError(w, http.StatusMethodNotAllowed, err.Error())
-				return
-			}
-
-			// 2. Validate: security (via the auth callback), then path/
-			//    query/header params, then the request body.
-			input := &openapi3filter.RequestValidationInput{
-				Request:    r,
-				PathParams: pathParams,
-				Route:      route,
-				Options: &openapi3filter.Options{
-					AuthenticationFunc: auth,
-				},
-			}
-			if err := openapi3filter.ValidateRequest(r.Context(), input); err != nil {
-				// Security failures are 401s, everything else is a 400.
-				// errors.As digs the authError out of the validator's
-				// wrapping (SecurityRequirementsError unwraps to []error).
-				var aerr *authError
-				if errors.As(err, &aerr) {
-					writeError(w, http.StatusUnauthorized, aerr.message)
-				} else {
-					writeError(w, http.StatusBadRequest, err.Error())
-				}
-				return
-			}
-
-			// 3. Pass the request on. ValidateRequest restores the body
-			//    after reading it, and the auth callback may have swapped
-			//    in a new request carrying the user's context — so forward
-			//    the validator's request, not our earlier copy.
-			next.ServeHTTP(w, input.Request)
-		})
-	}, nil
+	return nethttpmiddleware.OapiRequestValidatorWithOptions(spec, &nethttpmiddleware.Options{
+		Options: openapi3filter.Options{
+			AuthenticationFunc: enforceSecurity,
+		},
+		// The spec documents `servers` for Swagger UI. The library warns
+		// that servers can trigger Host-header validation — but our "/"
+		// server entry matches any host, so the warning doesn't apply.
+		SilenceServersWarning: true,
+		ErrorHandler: func(w http.ResponseWriter, message string, statusCode int) {
+			writeError(w, statusCode, message)
+		},
+	}), nil
 }
